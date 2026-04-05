@@ -278,6 +278,8 @@ if __name__ == '__main__':
     local_rank = int(os.environ['LOCAL_RANK'])
     rank = int(os.environ['RANK'])
     world_size = int(os.environ['WORLD_SIZE'])
+    
+    init_ddp(local_rank)
 
     args = parse_args()
     print(args.epochs)
