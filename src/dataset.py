@@ -1,124 +1,120 @@
 import torch
 from PIL import Image
+import cv2
 import numpy as np
 from torch.utils.data import Dataset
 from pathlib import Path
-from ultralytics.data.augment import (
-    Compose, Mosaic,
-    MixUp, RandomPerspective, RandomHSV,
-    RandomFlip, LetterBox, Albumentations
-)
+import albumentations as A
+from ultralytics.utils.instance import Instances
+import random
+import os
+
 
 
 class WeaponsDataset(Dataset):
-    def __init__(self, data_dir):
+    def __init__(self, data_dir, img_size=768):
         self.img_dir = Path(f"{data_dir}/images")
         self.label_dir = Path(f"{data_dir}/labels")
-        self.images = [f for f in self.img_dir.iterdir() if f.is_file()]
+        self.images = [str(os.path.join(self.img_dir, f)) for f in os.listdir(self.img_dir) if f.endswith((".jpg", ".jpeg", ".png"))]
+        self.img_size = img_size
+        self.transform = A.Compose([
+            A.LongestMaxSize(max_size=img_size),
+            A.PadIfNeeded(img_size, img_size, border_mode=cv2.BORDER_CONSTANT),
+            A.HorizontalFlip(p=0.5),
+            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2),
+            A.Mosaic(p=0.5, target_size=(img_size, img_size), fit_mode='contain', metadata_key="mosaic_metadata"),
+        ],
+            bbox_params=A.BboxParams(
+                format="yolo",  # xywh norm
+                label_fields=["class_labels"],
+                clip=True,
+                min_visibility=0.1
+            )
+        )
+
 
     def __len__(self):
         return len(self.images)
 
-    def __getitem__(self, idx):
+    def load_sample(self, idx):
         img_path = self.images[idx]
-        label_path = self.label_dir / f"{img_path.stem}.txt"
-        img = Image.open(img_path).convert("RGB")
 
-        labels = []
-        content = label_path.read_text().strip()
+        img = cv2.imread(str(img_path))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        if content:
-            for label in content.splitlines():
-                parts = list(map(float, label.split()))
-                labels.append(parts)
-        if labels:
-            w_img, h_img = img.size
-            labels = torch.tensor(labels, dtype=torch.float32)
+        label_path = img_path.replace("images", "labels").replace(".jpg", ".txt")
 
-            classes = labels[:, 0]
-            boxes = labels[:, 1:]
+        bboxes = []
+        class_labels = []
 
-            # Convert bbox coords xywh → xyxy (normalized)
-            x, y, w, h = boxes.unbind(-1)
-            boxes = torch.stack([
-                (x - w / 2) * w_img,
-                (y - h / 2) * h_img,
-                (x + w / 2) * w_img,
-                (y + h / 2) * h_img,
-            ], dim=-1)
-        else:
-            classes = torch.zeros((0,), dtype=torch.float32)
-            boxes = torch.zeros((0, 4), dtype=torch.float32)
+        if os.path.exists(label_path):
+            with open(label_path, "r") as f:
+                for line in f.readlines():
+                    c, x, y, w, h = map(float, line.strip().split())
+                    class_labels.append(int(c))
+                    bboxes.append([x, y, w, h])
 
         return {
-            "img": img,
-            "cls": classes,
-            "bboxes": boxes,
-            "im_file": str(img_path),
+            "image": img,
+            "bboxes": np.array(bboxes),
+            "class_labels": class_labels,
         }
 
+    def get_mosaic_metadata(self, idx):
+        return [
+            self.load_sample(i)
+            for i in random.sample(range(len(self)), 5)
+        ]
 
-class YoloCollate:
-    def __init__(self, dataset, imgsz=768):
-        self.mosaic = Mosaic(dataset=dataset, imgsz=imgsz, p=1.0)
-        self.mixup = MixUp(dataset=dataset, p=0.2)
-        self.perspective = RandomPerspective(
-            degrees=15,
-            translate=0.1,
-            scale=0.5,
-            shear=2,
-            perspective=0.0,
+    def __getitem__(self, idx):
+
+        sample = self.load_sample(idx)
+
+
+        mosaic_metadata = self.get_mosaic_metadata(idx)
+
+        out = self.transform(
+            image=sample["image"],
+            bboxes=sample["bboxes"],
+            class_labels=sample["class_labels"],
+            mosaic_metadata=mosaic_metadata,
         )
-        self.hsv = RandomHSV(
-            hgain=0.05,
-            sgain=0.05,
-            vgain=0.05,
-        )
 
-    def __call__(self, batch):
-        samples = list(batch)
-        new_samples = []
-
-        for sample in samples:
-            sample = self.mosaic(sample)
-            sample = self.mixup(sample)
-            sample = self.perspective(sample)
-            sample = self.hsv(sample)
-
-            img = sample["img"]
-
-            if not isinstance(img, torch.Tensor):
-                img = torch.from_numpy(
-                    (np.array(img)).transpose(2, 0, 1)
-                ).float() / 255.0
-
-            sample["img"] = img.contiguous()
-
-            new_samples.append(sample)
-
-        imgs = torch.stack([s["img"] for s in new_samples])
-        cls_list, box_list, batch_idx = [], [], []
-
-        for i, s in enumerate(new_samples):
-            n = len(s['cls'])
-            if n == 0:
-                continue
-            cls_list.append(s['cls'])
-            box_list.append(s['bboxes'])
-            batch_idx.append(torch.full((n,), i, dtype=torch.long))
-
-        if len(cls_list):
-            cls = torch.cat(cls_list).unsqueeze(1)
-            bboxes = torch.cat(box_list)
-            batch_idx = torch.cat(batch_idx)
-        else:
-            cls = torch.zeros((0,1))
-            bboxes = torch.zeros((0,4))
-            batch_idx = torch.zeros((0,), dtype=torch.long)
+        img = out["image"]
+        bboxes = torch.tensor(out["bboxes"], dtype=torch.float32)
+        labels = torch.tensor(out["class_labels"], dtype=torch.int64)
 
         return {
-            "img": imgs,
-            "cls": cls,
+            "image": img,
+            "class_labels": labels,
             "bboxes": bboxes,
-            "im_file": batch_idx,
         }
+
+def collate_fn(batch):
+    images = []
+    cls_list = []
+    box_list = []
+    batch_idx = []
+
+    for i, item in enumerate(batch):
+        img = item["image"]
+        bboxes = item["bboxes"]
+        cls = item["class_labels"]
+
+        img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+        images.append(img)
+
+        if len(bboxes) > 0:
+            for b, c in zip(bboxes, cls):
+                x, y, w, h = b
+                cls_list.append(c)
+                box_list.append([x, y, w, h])
+                batch_idx.append(i)
+
+    return {
+        "img": torch.stack(images),
+        "cls": torch.tensor(cls_list, dtype=torch.float32),
+        "bboxes": torch.tensor(box_list, dtype=torch.float32),
+        "batch_idx": torch.tensor(batch_idx, dtype=torch.int64),
+    }
+

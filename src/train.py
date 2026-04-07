@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from ultralytics.utils.loss import v8DetectionLoss
 from tqdm import tqdm
-from dataset import WeaponsDataset, YoloCollate
+from dataset import WeaponsDataset, collate_fn
 import os
 import tarfile
 import torch.nn as nn
@@ -19,46 +19,65 @@ import argparse
 
 
 # init DDP
-def init_ddp(local_rank):
-    dist.init_process_group(backend='nccl')
-    torch.cuda.set_device(local_rank)
-    return local_rank
+def init_ddp():
+    if "RANK" in os.environ:
+        dist.init_process_group(backend='nccl')
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        return True, local_rank
+    return False, None
 
 
-def download_data():
-    if dist.get_rank() == 0:
+def get_device(local_rank, use_ddp):
+    if torch.cuda.is_available():
+        return torch.device(f"cuda:{local_rank}" if use_ddp else "cuda:0")
+    return torch.device("cpu")
+
+
+def download_data(download_path):
+    os.makedirs(download_path, exist_ok=True)
+    is_ddp = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if is_ddp else 0
+    if rank == 0:
+        print("Downloading data...")
         s3 = boto3.client('s3', region_name='us-east-1')
-        s3.download_file('agression-model', 'weapons_768.tar', '/tmp/weapons_768.tar')
+        s3.download_file('agression-model', 'weapons_768.tar', f'{download_path}/weapons_768.tar')
         print("Extracting...")
 
-        with tarfile.open('/tmp/weapons_768.tar', 'r:*') as tar:
-            tar.extractall(path="/tmp/data")
-        os.remove('/tmp/weapons_768')
+        with tarfile.open(f'{download_path}/weapons_768.tar', 'r:*') as tar:
+            tar.extractall(path=download_path)
+        os.remove(f'{download_path}/weapons_768.tar')
         print("Done extracting data")
-    dist.barrier()
-    return '/tmp/data'
+    if is_ddp:
+        dist.barrier()
 
 
 # Create dataloader
-def get_dataloader(data_path, batch_size, shuffle=False):
+def get_dataloader(data_path, batch_size=32, num_workers=4, distributed=False):
     dataset = WeaponsDataset(data_path)
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=dist.get_world_size(),
-        rank=dist.get_rank(),
-        shuffle=shuffle,
-    )
-    collate = YoloCollate(dataset)
+
+    sampler = None
+    shuffle = True
+    if distributed:
+        sampler = DistributedSampler(
+            dataset,
+            shuffle=True,
+        )
+        shuffle = False
+
+    pin_memory = torch.cuda.is_available()
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
+        shuffle=shuffle,
         sampler=sampler,
-        num_workers=4,
-        collate_fn=collate,
-        pin_memory=True,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        pin_memory=pin_memory,
         persistent_workers=True,
+        drop_last=True,
     )
-    return loader
+    return loader, sampler
 
 
 def get_model(device):
@@ -89,15 +108,28 @@ def get_model(device):
     return model
 
 
-def save_checkpoint(model, optimizer, epoch, path, rank):
+def save_checkpoint(model, optimizer, epoch, path):
+    is_ddp = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if is_ddp else 0
     if rank == 0:
+        state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
         torch.save({
             "epoch": epoch,
-            "model_state_dict": model.module.state_dict(),
+            "model_state_dict": state_dict,
             "optimizer_state_dict": optimizer.state_dict(),
         }, path)
         print("Checkpoint saved")
-    dist.barrier()
+    if is_ddp:
+        dist.barrier()
+
+def save_model(model, file_path):
+    is_ddp = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if is_ddp else 0
+    if rank == 0:
+        state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+        torch.save(state_dict, file_path)
+    if is_ddp:
+        dist.barrier()
 
 
 def load_checkpoint(model, optimizer, path):
@@ -195,10 +227,12 @@ def validate_loss(model, criterion, val_loader, device):
     }
 
 
-def train_weapon_yolo(model, optimizer, scheduler, criterion, train_loader,
-                      val_loader, n_epochs, device, rank, checkpoint_dir, model_dir):
+def train_weapon_yolo(model, optimizer, scheduler, criterion, train_loader, train_sampler,
+                      val_loader, n_epochs, device, checkpoint_dir, model_dir):
     best_map = 0.0
     for epoch in range(n_epochs):
+        if train_sampler:
+            train_sampler.set_epoch(epoch)
         model.train()
         total_loss = class_loss = box_loss = dfl_loss = 0.0
         # test = next(iter(train_loader))
@@ -207,9 +241,12 @@ def train_weapon_yolo(model, optimizer, scheduler, criterion, train_loader,
             train_loader,
             desc=f"Epoch {epoch+1}/{n_epochs}")
         for batch in pbar:
-            images = batch["img"].to(device)
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                     for k, v in batch.items()}
+            batch = {
+                k: v.to(device) if torch.is_tensor(v) else v
+                for k, v in batch.items()
+            }
+
+            images = batch["img"]
 
             y_pred = model(images)
             loss, loss_items = criterion(y_pred, batch)
@@ -239,10 +276,10 @@ def train_weapon_yolo(model, optimizer, scheduler, criterion, train_loader,
 
         scheduler.step()
 
-        save_checkpoint(model, optimizer, epoch,
-                        f"{checkpoint_dir}/epoch{epoch}.pt", rank)
+        save_checkpoint(model, optimizer, epoch,f"{checkpoint_dir}/epoch{epoch}.pt")
 
         n = len(train_loader)
+
         print(
             f"Epoch {epoch+1}/{n_epochs} | "
             f"train loss: {total_loss/n:.4f} "
@@ -250,6 +287,7 @@ def train_weapon_yolo(model, optimizer, scheduler, criterion, train_loader,
         )
 
         val_losses = validate_loss(model, criterion, val_loader, device)
+
         print(
             f"Validation | "
             f"loss: {val_losses['loss']:.4f} "
@@ -260,52 +298,66 @@ def train_weapon_yolo(model, optimizer, scheduler, criterion, train_loader,
             f"mAP50_95: {val_losses['mAP50_95']:.4f}"
         )
 
-        if rank == 0 and val_losses["mAP50"] > best_map:
+        if val_losses["mAP50"] > best_map:
             best_map = val_losses["mAP50"]
-            torch.save(model.module.state_dict(), f"{model_dir}/best_mAP50.pt")
+            save_model(model, f"{model_dir}/best_mAP50.pt")
             print("Saved BEST model with mAP50")
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--epochs', type=int, default=10)
-    parser.add_argument('--batch-size', type=int, default=32)
-    parser.add_argument('--checkpoint-dir', type=str, default='/opt/ml/checkpoints')
+    parser.add_argument('--batch-size', type=int, default=16)
+    parser.add_argument('--checkpoint-dir', type=str, default='./checkpoints')
+    parser.add_argument('--model-dir', type=str, default='./model')
+    parser.add_argument('--data-dir', type=str, default='./data')
     return parser.parse_args()
 
 
 if __name__ == '__main__':
-    local_rank = int(os.environ['LOCAL_RANK'])
-    rank = int(os.environ['RANK'])
-    world_size = int(os.environ['WORLD_SIZE'])
-    
-    init_ddp(local_rank)
+    is_dist, local_rank = init_ddp()
 
     args = parse_args()
-    print(args.epochs)
-    print(args.batch_size)
-    data_path = download_data()
-    data_path = '/tmp/data'
-    checkpoint_dir = args.checkpoint_dir
-    model_dir = '/opt/ml/model'
 
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    #download_data(args.data_dir)
 
-    device = init_ddp(local_rank)
-    model = get_model(device)
-    model.to(device)
-    train_loader = get_dataloader(f"{data_path}/train", args.batch_size,
-                                  shuffle=True)
-    val_loader = get_dataloader(f"{data_path}/valid", args.batch_size)
 
-    EPOCHS = args.epochs
+    device = get_device(local_rank, is_dist)
+
+    model = get_model(device).to(device)
+    if is_dist:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
+    train_loader, train_sampler = get_dataloader(
+        f"{args.data_dir}/train",
+        args.batch_size,
+        distributed=is_dist,
+    )
+    val_loader, val_sampler = get_dataloader(
+        f"{args.data_dir}/valid",
+        args.batch_size,
+        distributed=False,
+    )
+
     criterion = v8DetectionLoss(model)
     criterion.hyp = SimpleNamespace(box=7.5, cls=1.0, dfl=1.5)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=EPOCHS, eta_min=1e-6)
-    model = DDP(model, device_ids=[device])
 
-    train_weapon_yolo(model, optimizer, scheduler, criterion,
-                      train_loader, val_loader, EPOCHS, device,
-                      rank, checkpoint_dir, model_dir)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=1e-6)
+
+    train_weapon_yolo(
+        model,
+        optimizer,
+        scheduler,
+        criterion,
+        train_loader,
+        train_sampler,
+        val_loader,
+        args.epochs,
+        device,
+        args.checkpoint_dir,
+        args.model_dir,
+    )
+

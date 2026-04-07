@@ -1,0 +1,5 @@
+data
+.venv
+yolo11s.pt
+.idea
+__pycache__
