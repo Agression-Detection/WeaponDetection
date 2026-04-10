@@ -52,9 +52,8 @@ def download_data(download_path):
 
 
 # Create dataloader
-def get_dataloader(data_path, batch_size=32, num_workers=4, distributed=False):
-    dataset = WeaponsDataset(data_path)
-
+def get_dataloader(data_path, batch_size=64, num_workers=4, distributed=False, augment=False):
+    dataset = WeaponsDataset(data_path, augment=augment)
     sampler = None
     shuffle = True
     if distributed:
@@ -73,7 +72,6 @@ def get_dataloader(data_path, batch_size=32, num_workers=4, distributed=False):
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=pin_memory,
-        persistent_workers=True,
         drop_last=True,
     )
     return loader, sampler
@@ -91,19 +89,20 @@ def get_model(device):
     for i in range(3):
         old_conv = detect_layer.cv3[i][2]
         in_ch = old_conv.in_channels
-        print(f"cv3.{i}.2 — in_ch: {in_ch}, old out_ch: {old_conv.out_channels}")
 
         detect_layer.cv3[i][2] = nn.Conv2d(in_ch, num_classes, kernel_size=1)
         nn.init.normal_(detect_layer.cv3[i][2].weight, std=0.01)
         nn.init.constant_(detect_layer.cv3[i][2].bias, 0)
 
-    for i in range(3):
-        conv = detect_layer.cv3[i][2]
-        print(f"cv3.{i}.2 → in: {conv.in_channels}, out: {conv.out_channels}")
+    for i, layer in enumerate(model.model):
+        requires_grad = i >= 10
+        for p in layer.parameters():
+            p.requires_grad = requires_grad
 
-    for name, module in model.named_modules():
-        if hasattr(module, 'nc'):
-            print(name, module.nc)
+    for i in range(3):
+        for p in detect_layer.cv3[i][2].parameters():
+            p.requires_grad = True
+
     return model
 
 
@@ -117,7 +116,6 @@ def save_checkpoint(model, optimizer, epoch, path):
             "model_state_dict": state_dict,
             "optimizer_state_dict": optimizer.state_dict(),
         }, path)
-        print("Checkpoint saved")
     if is_ddp:
         dist.barrier()
 
@@ -199,11 +197,6 @@ def validate_loss(model, criterion, val_loader, device):
                     "boxes": gt_boxes,
                     "labels": gt_labels,
                 })
-            for p in formatted_preds:
-                print(p["labels"].shape)
-
-            for t in formatted_targets:
-                print(t["labels"].shape)
 
             metric.update(formatted_preds, formatted_targets)
 
@@ -213,7 +206,7 @@ def validate_loss(model, criterion, val_loader, device):
             if torch.isnan(loss) or torch.isinf(loss):
                 continue
 
-            total_loss += sum(loss_items).item()
+            total_loss += loss_items.sum().item()
             box_loss += loss_items[0].item()
             class_loss += loss_items[1].item()
             dfl_loss += loss_items[2].item()
@@ -233,8 +226,26 @@ def validate_loss(model, criterion, val_loader, device):
 
 def train_weapon_yolo(model, optimizer, scheduler, criterion, train_loader, train_sampler,
                       val_loader, n_epochs, device, checkpoint_dir, model_dir):
+    scaler = torch.amp.GradScaler('cuda')
     best_map = 0.0
     for epoch in range(n_epochs):
+
+        if epoch == 15:
+            for p in model.model[10:].parameters():
+                p.requires_grad = True
+        if epoch == 25:
+       # Unfreeze backbone partially
+            for p in model.model[:10].parameters():
+                p.requires_grad = True
+        if epoch == 35:
+            print("Unfreezing full model")
+            for p in model.parameters():
+                p.requires_grad = True
+            optimizer = torch.optim.AdamW([
+                {"params": model.model[:10].parameters(), "lr": 1e-5},  # backbone — very slow
+                {"params": model.model[10:].parameters(), "lr": 5e-5},  # neck+head — faster
+            ], weight_decay=1e-4)
+
         if train_sampler:
             train_sampler.set_epoch(epoch)
         model.train()
@@ -245,28 +256,35 @@ def train_weapon_yolo(model, optimizer, scheduler, criterion, train_loader, trai
             train_loader,
             desc=f"Epoch {epoch+1}/{n_epochs}")
         for batch in pbar:
+            optimizer.zero_grad()
             batch = {
                 k: v.to(device) if torch.is_tensor(v) else v
                 for k, v in batch.items()
             }
-
             images = batch["img"]
 
-            y_pred = model(images)
-            loss, loss_items = criterion(y_pred, batch)
+            if torch.cuda.is_available():
+                with torch.amp.autocast('cuda'):
+                    y_pred = model(images)
+                    loss, loss_items = criterion(y_pred, batch)
+            else:
+                y_pred = model(images)
+                loss, loss_items = criterion(y_pred, batch)
             loss = loss.sum()
 
-            if torch.isnan(loss) or torch.isinf(loss):
-                print("NaN/Inf detected for loss, skipping batch")
-                continue
 
-            loss.backward()
+            scaler.scale(loss).backward()
+            # loss.backward()
             trainable = [p for p in model.parameters() if p.requires_grad]
             torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
-            optimizer.step()
-            optimizer.zero_grad()
 
-            total_loss += sum(loss_items).item()
+            scaler.step(optimizer)
+            # optimizer.step()
+            scaler.update()
+
+
+
+            total_loss += loss_items.sum().item()
             box_loss += loss_items[0].item()
             class_loss += loss_items[1].item()
             dfl_loss += loss_items[2].item()
@@ -279,6 +297,7 @@ def train_weapon_yolo(model, optimizer, scheduler, criterion, train_loader, trai
             })
 
         scheduler.step()
+
 
         save_checkpoint(model, optimizer, epoch,f"{checkpoint_dir}/epoch{epoch}.pt")
 
@@ -317,7 +336,6 @@ def parse_args():
     parser.add_argument('--data-dir', type=str, default='./data')
     return parser.parse_args()
 
-
 if __name__ == '__main__':
     is_dist, local_rank = init_ddp()
 
@@ -326,8 +344,7 @@ if __name__ == '__main__':
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     os.makedirs(args.data_dir, exist_ok=True)
 
-    #download_data(args.data_dir)
-
+    download_data(args.data_dir)
 
     device = get_device(local_rank, is_dist)
 

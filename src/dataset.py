@@ -12,25 +12,55 @@ import os
 
 
 class WeaponsDataset(Dataset):
-    def __init__(self, data_dir, img_size=768):
+    def __init__(self, data_dir, img_size=768, augment=True):
         self.img_dir = Path(f"{data_dir}/images")
         self.label_dir = Path(f"{data_dir}/labels")
         self.images = [str(os.path.join(self.img_dir, f)) for f in os.listdir(self.img_dir) if f.endswith((".jpg", ".jpeg", ".png"))]
         self.img_size = img_size
-        self.transform = A.Compose([
-            A.LongestMaxSize(max_size=img_size),
-            A.PadIfNeeded(img_size, img_size, border_mode=cv2.BORDER_CONSTANT),
-            A.HorizontalFlip(p=0.5),
-            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2),
-            A.Mosaic(p=0.5, target_size=(img_size, img_size), fit_mode='contain', metadata_key="mosaic_metadata"),
-        ],
-            bbox_params=A.BboxParams(
-                format="yolo",  # xywh norm
-                label_fields=["class_labels"],
-                clip=True,
-                min_visibility=0.1
+        if augment:
+            self.transform = A.Compose([
+                A.RandomResizedCrop(
+                    size=(img_size, img_size),
+                    scale=(0.5, 1.0),
+                    ratio=(0.75, 1.33),
+                    p=1.0
+                    ),
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                A.Rotate(limit=10, border_mode=cv2.BORDER_CONSTANT, p=0.3),
+                A.RandomBrightnessContrast(
+                    brightness_limit=0.1,
+                    contrast_limit=0.1),
+                A.HueSaturationValue(
+                    hue_shift_limit=5,
+                    sat_shift_limit=20,
+                    val_shift_limit=20),
+                A.OneOf([
+                    A.MotionBlur(blur_limit=5),
+                    A.GaussNoise(std_range=(0.02, 0.08)),
+                    A.ImageCompression(quality_range=(75, 100)),
+                ], p=0.3),
+                A.Mosaic(p=0.2, target_size=(img_size, img_size), fit_mode='contain', metadata_key="mosaic_metadata"),
+            ],
+                bbox_params=A.BboxParams(
+                    format="yolo",  # xywh norm
+                    label_fields=["class_labels"],
+                    clip=True,
+                    min_visibility=0.1
+                )
             )
-        )
+        else:
+            self.transform = A.Compose([
+                A.LongestMaxSize(max_size=img_size),
+                A.PadIfNeeded(img_size, img_size, border_mode=cv2.BORDER_CONSTANT),
+            ],
+                bbox_params=A.BboxParams(
+                    format="yolo",  # xywh norm
+                    label_fields=["class_labels"],
+                    clip=True,
+                    min_visibility=0.1
+                )
+            )
 
 
     def __len__(self):
@@ -128,4 +158,3 @@ def collate_fn(batch):
         "bboxes": torch.tensor(box_list, dtype=torch.float32),
         "batch_idx": torch.tensor(batch_idx, dtype=torch.int64),
     }
-

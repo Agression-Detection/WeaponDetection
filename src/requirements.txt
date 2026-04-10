@@ -1,2 +1,4 @@
 ultralytics
 torchmetrics[detection]
+boto3
+albumentations
