@@ -51,8 +51,19 @@ class WeaponsDataset(Dataset):
             with open(label_path, "r") as f:
                 for line in f.readlines():
                     c, x, y, w, h = map(float, line.strip().split())
+
+                    if w <= 0 or h <= 0:
+                        continue
+                    if not (0 <= x <= 1 and 0 <= y <= 1):
+                        continue
+
                     class_labels.append(int(c))
                     bboxes.append([x, y, w, h])
+
+        if len(bboxes) == 0:
+            bboxes = np.zeros((0, 4), dtype=np.float32)
+        else:
+            bboxes = np.array(bboxes, dtype=np.float32)
 
         return {
             "image": img,

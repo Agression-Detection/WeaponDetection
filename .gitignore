@@ -3,3 +3,5 @@ data
 yolo11s.pt
 .idea
 __pycache__
+checkpoints
+model

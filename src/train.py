@@ -35,7 +35,6 @@ def get_device(local_rank, use_ddp):
 
 
 def download_data(download_path):
-    os.makedirs(download_path, exist_ok=True)
     is_ddp = dist.is_available() and dist.is_initialized()
     rank = dist.get_rank() if is_ddp else 0
     if rank == 0:
@@ -182,7 +181,7 @@ def validate_loss(model, criterion, val_loader, device):
 
                 mask = batch["batch_idx"] == i
                 gt_boxes = batch["bboxes"][mask].to(device)
-                gt_labels = batch["cls"][mask].long().squeeze(-1).to(device)
+                gt_labels = batch["cls"][mask].long().view(-1).to(device)
                 x, y, w_box, h_box = gt_boxes.unbind(-1)
 
                 gt_boxes = torch.stack([
@@ -200,6 +199,11 @@ def validate_loss(model, criterion, val_loader, device):
                     "boxes": gt_boxes,
                     "labels": gt_labels,
                 })
+            for p in formatted_preds:
+                print(p["labels"].shape)
+
+            for t in formatted_targets:
+                print(t["labels"].shape)
 
             metric.update(formatted_preds, formatted_targets)
 
@@ -318,6 +322,9 @@ if __name__ == '__main__':
     is_dist, local_rank = init_ddp()
 
     args = parse_args()
+    os.makedirs(args.model_dir, exist_ok=True)
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    os.makedirs(args.data_dir, exist_ok=True)
 
     #download_data(args.data_dir)
 
