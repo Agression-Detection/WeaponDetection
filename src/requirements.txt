@@ -2,3 +2,4 @@ ultralytics
 torchmetrics[detection]
 boto3
 albumentations
+numpy==1.26.4

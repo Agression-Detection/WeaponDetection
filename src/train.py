@@ -351,6 +351,9 @@ if __name__ == '__main__':
     model = get_model(device).to(device)
     if is_dist:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        criterion = v8DetectionLoss(model.module)
+    else:
+        criterion = v8DetectionLoss(model)
 
     train_loader, train_sampler = get_dataloader(
         f"{args.data_dir}/train",
@@ -363,11 +366,9 @@ if __name__ == '__main__':
         distributed=False,
     )
 
-    criterion = v8DetectionLoss(model)
+
     criterion.hyp = SimpleNamespace(box=7.5, cls=1.0, dfl=1.5)
-
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
-
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=1e-6)
 

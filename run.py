@@ -9,6 +9,7 @@ estimator = PyTorch(
     source_dir="./src",
     entry_point='train.py',
     role=role,
+    #use_spot_instances=True,
     instance_type='ml.g4dn.xlarge',
     instance_count=1,
     framework_version='2.0.0',
