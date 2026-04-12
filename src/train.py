@@ -77,8 +77,7 @@ def get_dataloader(data_path, batch_size=64, num_workers=4, distributed=False, a
     return loader, sampler
 
 
-def get_model(device):
-
+def get_model():
     model = YOLO('yolo11s.pt').model
     print("YOLOv11 Loaded Successfully!")
     num_classes = 3
@@ -94,14 +93,6 @@ def get_model(device):
         nn.init.normal_(detect_layer.cv3[i][2].weight, std=0.01)
         nn.init.constant_(detect_layer.cv3[i][2].bias, 0)
 
-    for i, layer in enumerate(model.model):
-        requires_grad = i >= 10
-        for p in layer.parameters():
-            p.requires_grad = requires_grad
-
-    for i in range(3):
-        for p in detect_layer.cv3[i][2].parameters():
-            p.requires_grad = True
 
     return model
 
@@ -226,25 +217,18 @@ def validate_loss(model, criterion, val_loader, device):
 
 def train_weapon_yolo(model, optimizer, scheduler, criterion, train_loader, train_sampler,
                       val_loader, n_epochs, device, checkpoint_dir, model_dir):
-    scaler = torch.amp.GradScaler('cuda')
+    scaler = torch.cuda.amp.GradScaler()
     best_map = 0.0
     for epoch in range(n_epochs):
 
         if epoch == 15:
-            for p in model.model[10:].parameters():
-                p.requires_grad = True
+            print(f"Epoch {epoch}: Starting backbone unfreezing...")
+            optimizer.param_groups[0]['lr'] = 1e-6
         if epoch == 25:
-       # Unfreeze backbone partially
-            for p in model.model[:10].parameters():
-                p.requires_grad = True
+            optimizer.param_groups[0]['lr'] = 1e-5
         if epoch == 35:
-            print("Unfreezing full model")
-            for p in model.parameters():
-                p.requires_grad = True
-            optimizer = torch.optim.AdamW([
-                {"params": model.model[:10].parameters(), "lr": 1e-5},  # backbone — very slow
-                {"params": model.model[10:].parameters(), "lr": 5e-5},  # neck+head — faster
-            ], weight_decay=1e-4)
+            print(f"Epoch {epoch}: Fully unfreezing backbone...")
+            optimizer.param_groups[0]['lr'] = 5e-5
 
         if train_sampler:
             train_sampler.set_epoch(epoch)
@@ -256,6 +240,8 @@ def train_weapon_yolo(model, optimizer, scheduler, criterion, train_loader, trai
             train_loader,
             desc=f"Epoch {epoch+1}/{n_epochs}")
         for batch in pbar:
+            print(
+                f"GPU Memory: {torch.cuda.memory_allocated() / 1e9:.2f}GB / {torch.cuda.get_device_properties(device).total_memory / 1e9:.2f}GB")
             optimizer.zero_grad()
             batch = {
                 k: v.to(device) if torch.is_tensor(v) else v
@@ -264,7 +250,7 @@ def train_weapon_yolo(model, optimizer, scheduler, criterion, train_loader, trai
             images = batch["img"]
 
             if torch.cuda.is_available():
-                with torch.amp.autocast('cuda'):
+                with torch.cuda.amp.autocast():
                     y_pred = model(images)
                     loss, loss_items = criterion(y_pred, batch)
             else:
@@ -348,12 +334,24 @@ if __name__ == '__main__':
 
     device = get_device(local_rank, is_dist)
 
-    model = get_model(device).to(device)
+    model = get_model().to(device)
     if is_dist:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
         criterion = v8DetectionLoss(model.module)
+        model = model.module
     else:
         criterion = v8DetectionLoss(model)
+
+    optimizer = torch.optim.AdamW([
+        {
+            "params": model.model[:10].parameters(),  # backbone
+            "lr": 1e-7,  # VERY slow at first (effectively frozen)
+        },
+        {
+            "params": model.model[10:].parameters(),  # neck+head
+            "lr": 5e-4,  # Fast training of head
+        },
+    ], weight_decay=1e-4)
 
     train_loader, train_sampler = get_dataloader(
         f"{args.data_dir}/train",
@@ -368,7 +366,7 @@ if __name__ == '__main__':
 
 
     criterion.hyp = SimpleNamespace(box=7.5, cls=1.0, dfl=1.5)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=1e-6)
 

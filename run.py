@@ -12,7 +12,7 @@ estimator = PyTorch(
     #use_spot_instances=True,
     instance_type='ml.g4dn.xlarge',
     instance_count=1,
-    framework_version='2.0.0',
+    framework_version='2.2.0',
     py_version='py310',
     distribution={
         'torch_distributed': {
