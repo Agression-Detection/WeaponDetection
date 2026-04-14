@@ -10,7 +10,7 @@ estimator = PyTorch(
     entry_point='train.py',
     role=role,
     #use_spot_instances=True,
-    instance_type='ml.g4dn.xlarge',
+    instance_type='ml.g5.12xlarge',
     instance_count=1,
     framework_version='2.2.0',
     py_version='py310',
@@ -20,8 +20,8 @@ estimator = PyTorch(
         }
     },
     hyperparameters={
-        'epochs': 100,
-        'batch-size': 64,
+        'epochs': 150,
+        'batch-size': 48,
         'checkpoint-dir': local_checkpoint_dir,
         'model-dir': '/opt/ml/model',
         'data-dir': '/opt/ml/data'

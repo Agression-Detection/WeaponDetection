@@ -52,7 +52,7 @@ def download_data(download_path):
 
 
 # Create dataloader
-def get_dataloader(data_path, batch_size=64, num_workers=4, distributed=False, augment=False):
+def get_dataloader(data_path, batch_size=64, num_workers=2, distributed=False, augment=False):
     dataset = WeaponsDataset(data_path, augment=augment)
     sampler = None
     shuffle = True
@@ -71,8 +71,7 @@ def get_dataloader(data_path, batch_size=64, num_workers=4, distributed=False, a
         sampler=sampler,
         num_workers=num_workers,
         collate_fn=collate_fn,
-        pin_memory=pin_memory,
-        drop_last=True,
+        pin_memory=pin_memory
     )
     return loader, sampler
 
@@ -93,6 +92,12 @@ def get_model():
         nn.init.normal_(detect_layer.cv3[i][2].weight, std=0.01)
         nn.init.constant_(detect_layer.cv3[i][2].bias, 0)
 
+    # Freeze all
+    for p in model.parameters():
+        p.requires_grad = False
+
+    for p in model.model[23].parameters():
+        p.requires_grad = True
 
     return model
 
@@ -133,9 +138,12 @@ def load_checkpoint(model, optimizer, path):
 def validate_loss(model, criterion, val_loader, device):
     model.eval()
     total_loss = class_loss = box_loss = dfl_loss = 0.0
-    metric = MeanAveragePrecision(iou_type="bbox")
+    metric = MeanAveragePrecision(iou_type="bbox").to(device)
+    metric.reset()
     with torch.no_grad():
-        for batch in tqdm(val_loader, desc="Validating"):
+        # progress = tqdm(val_loader, desc="Validating")
+        print("Validating...", flush=True)
+        for batch in val_loader:
             images = batch["img"].to(device)
             batch = {k: v.to(device) if isinstance(v, torch.Tensor)
                      else v for k, v in batch.items()}
@@ -216,32 +224,39 @@ def validate_loss(model, criterion, val_loader, device):
 
 
 def train_weapon_yolo(model, optimizer, scheduler, criterion, train_loader, train_sampler,
-                      val_loader, n_epochs, device, checkpoint_dir, model_dir):
+                      val_loader, n_epochs, device, checkpoint_dir, model_dir, is_dist):
     scaler = torch.cuda.amp.GradScaler()
     best_map = 0.0
+    unwrapped_model = model.module if is_dist else model
     for epoch in range(n_epochs):
+        print(f"Training epoch {epoch+1}/{n_epochs}", flush=True)
+        if torch.cuda.is_available():
+            print(f"GPU Memory: {torch.cuda.memory_allocated() / 1e9:.2f}GB / {torch.cuda.get_device_properties(device).total_memory / 1e9:.2f}GB")
 
+        if epoch == 0:
+            print("Phase 1: Training head only", flush=True)
+            for p in unwrapped_model.model[23].parameters():
+                p.requires_grad = True
         if epoch == 15:
-            print(f"Epoch {epoch}: Starting backbone unfreezing...")
-            optimizer.param_groups[0]['lr'] = 1e-6
-        if epoch == 25:
-            optimizer.param_groups[0]['lr'] = 1e-5
-        if epoch == 35:
-            print(f"Epoch {epoch}: Fully unfreezing backbone...")
-            optimizer.param_groups[0]['lr'] = 5e-5
+            print("Phase 2: Training neck", flush=True)
+            for p in unwrapped_model.model[11:24].parameters():
+                p.requires_grad = True
+        if epoch == 30:
+            for p in unwrapped_model.parameters():
+                p.requires_grad = True
+
 
         if train_sampler:
             train_sampler.set_epoch(epoch)
         model.train()
         total_loss = class_loss = box_loss = dfl_loss = 0.0
         # test = next(iter(train_loader))
-        pbar = tqdm(
-            # [test],
-            train_loader,
-            desc=f"Epoch {epoch+1}/{n_epochs}")
-        for batch in pbar:
-            print(
-                f"GPU Memory: {torch.cuda.memory_allocated() / 1e9:.2f}GB / {torch.cuda.get_device_properties(device).total_memory / 1e9:.2f}GB")
+        # pbar = tqdm(
+        #     # [test],
+        #     train_loader,
+        #     desc=f"Epoch {epoch+1}/{n_epochs}")
+        for batch in train_loader:
+
             optimizer.zero_grad()
             batch = {
                 k: v.to(device) if torch.is_tensor(v) else v
@@ -275,15 +290,12 @@ def train_weapon_yolo(model, optimizer, scheduler, criterion, train_loader, trai
             class_loss += loss_items[1].item()
             dfl_loss += loss_items[2].item()
 
-            pbar.set_postfix({
-                "loss": f"{sum(loss_items).item():.4f}",
-                "cls":  f"{loss_items[1].item():.4f}",
-                "box":  f"{loss_items[0].item():.4f}",
-                "dfl":  f"{loss_items[2].item():.4f}",
-            })
-
-        scheduler.step()
-
+            # pbar.set_postfix({
+            #     "loss": f"{sum(loss_items).item():.4f}",
+            #     "cls":  f"{loss_items[1].item():.4f}",
+            #     "box":  f"{loss_items[0].item():.4f}",
+            #     "dfl":  f"{loss_items[2].item():.4f}",
+            # })
 
         save_checkpoint(model, optimizer, epoch,f"{checkpoint_dir}/epoch{epoch}.pt")
 
@@ -296,27 +308,28 @@ def train_weapon_yolo(model, optimizer, scheduler, criterion, train_loader, trai
         )
 
         val_losses = validate_loss(model, criterion, val_loader, device)
+        scheduler.step()
+        if val_losses is not None:
+            print(
+                f"Validation | "
+                f"loss: {val_losses['loss']:.4f} "
+                f"(box:{val_losses['box']:.4f} "
+                f"cls:{val_losses['cls']:.4f} "
+                f"dfl:{val_losses['dfl']:.4f})"
+                f"mAP50: {val_losses['mAP50']:.4f} "
+                f"mAP50_95: {val_losses['mAP50_95']:.4f}"
+            )
 
-        print(
-            f"Validation | "
-            f"loss: {val_losses['loss']:.4f} "
-            f"(box:{val_losses['box']:.4f} "
-            f"cls:{val_losses['cls']:.4f} "
-            f"dfl:{val_losses['dfl']:.4f})"
-            f"mAP50: {val_losses['mAP50']:.4f} "
-            f"mAP50_95: {val_losses['mAP50_95']:.4f}"
-        )
-
-        if val_losses["mAP50"] > best_map:
-            best_map = val_losses["mAP50"]
-            save_model(model, f"{model_dir}/best_mAP50.pt")
-            print("Saved BEST model with mAP50")
+            if val_losses["mAP50"] > best_map:
+                best_map = val_losses["mAP50"]
+                save_model(model, f"{model_dir}/best_mAP50.pt")
+                print("Saved BEST model with mAP50")
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=10)
-    parser.add_argument('--batch-size', type=int, default=16)
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--checkpoint-dir', type=str, default='./checkpoints')
     parser.add_argument('--model-dir', type=str, default='./model')
     parser.add_argument('--data-dir', type=str, default='./data')
@@ -336,39 +349,39 @@ if __name__ == '__main__':
 
     model = get_model().to(device)
     if is_dist:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-        criterion = v8DetectionLoss(model.module)
-        model = model.module
-    else:
-        criterion = v8DetectionLoss(model)
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
 
+    backbone_params = []
+    neck_params = []
+    head_params = []
+
+
+    criterion = v8DetectionLoss(model.module if is_dist else model)
     optimizer = torch.optim.AdamW([
-        {
-            "params": model.model[:10].parameters(),  # backbone
-            "lr": 1e-7,  # VERY slow at first (effectively frozen)
-        },
-        {
-            "params": model.model[10:].parameters(),  # neck+head
-            "lr": 5e-4,  # Fast training of head
-        },
-    ], weight_decay=1e-4)
+        {"params": [p for p in (model.module if is_dist else model).model[:11].parameters()], "lr": 1e-5},
+        {"params": [p for p in (model.module if is_dist else model).model[11:23].parameters()], "lr": 1e-4},
+        {"params": [p for p in (model.module if is_dist else model).model[23].parameters()], "lr": 1e-3},
+
+    ])
 
     train_loader, train_sampler = get_dataloader(
         f"{args.data_dir}/train",
         args.batch_size,
         distributed=is_dist,
+        augment=True
     )
     val_loader, val_sampler = get_dataloader(
         f"{args.data_dir}/valid",
         args.batch_size,
         distributed=False,
+        augment=False
     )
 
 
     criterion.hyp = SimpleNamespace(box=7.5, cls=1.0, dfl=1.5)
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=1e-6)
+        optimizer, T_max=args.epochs, eta_min=1e-7)
 
     train_weapon_yolo(
         model,
@@ -382,5 +395,6 @@ if __name__ == '__main__':
         device,
         args.checkpoint_dir,
         args.model_dir,
+        is_dist
     )
 
