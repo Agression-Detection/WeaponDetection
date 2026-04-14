@@ -138,7 +138,7 @@ def load_checkpoint(model, optimizer, path):
 def validate_loss(model, criterion, val_loader, device):
     model.eval()
     total_loss = class_loss = box_loss = dfl_loss = 0.0
-    metric = MeanAveragePrecision(iou_type="bbox").to(device)
+    metric = MeanAveragePrecision(iou_type="bbox")
     metric.reset()
     with torch.no_grad():
         # progress = tqdm(val_loader, desc="Validating")
@@ -373,7 +373,7 @@ if __name__ == '__main__':
     val_loader, val_sampler = get_dataloader(
         f"{args.data_dir}/valid",
         args.batch_size,
-        distributed=False,
+        distributed=is_dist,
         augment=False
     )
 
