@@ -445,9 +445,9 @@ if __name__ == '__main__':
     # with tarfile.open(f'../model/model.tar.gz', 'r:*') as tar:
     #     tar.extractall(path='../model')
     # print("extracted data")
-    # os.makedirs("output", exist_ok=True)
+    os.makedirs("../output", exist_ok=True)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    main('model/best_mAP50.pt', 'data/test', 16, "output")
+    main('../model/best_mAP50.pt', '../data/test', 16, "../output")
     model = get_model()
     model.load_state_dict(torch.load('../model/best_mAP50.pt', map_location=device))
     visualize_detections_from_path(model, '../data/test', device, 10,
