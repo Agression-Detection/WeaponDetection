@@ -5,3 +5,4 @@ yolo11s.pt
 __pycache__
 checkpoints
 model
+output/

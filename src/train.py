@@ -1,12 +1,9 @@
 from types import SimpleNamespace
-
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from ultralytics.utils.loss import v8DetectionLoss
-from tqdm import tqdm
-from dataset import WeaponsDataset, collate_fn
 import os
 import tarfile
 import torch.nn as nn
@@ -17,6 +14,10 @@ from ultralytics.utils.nms import non_max_suppression
 import boto3
 import argparse
 
+from model import get_model
+from dataset import WeaponsDataset, collate_fn
+from evaluate import evaluate
+from huggingface_hub import hf_hub_download
 
 # init DDP
 def init_ddp():
@@ -27,29 +28,29 @@ def init_ddp():
         return True, local_rank
     return False, None
 
-
 def get_device(local_rank, use_ddp):
     if torch.cuda.is_available():
         return torch.device(f"cuda:{local_rank}" if use_ddp else "cuda:0")
     return torch.device("cpu")
-
 
 def download_data(download_path):
     is_ddp = dist.is_available() and dist.is_initialized()
     rank = dist.get_rank() if is_ddp else 0
     if rank == 0:
         print("Downloading data...")
-        s3 = boto3.client('s3', region_name='us-east-1')
-        s3.download_file('agression-model', 'weapons_768.tar', f'{download_path}/weapons_768.tar')
+        data_path = hf_hub_download(
+            repo_id="b1n4r33/ViolentVideos",
+            filename="weapons_768.tar",
+            repo_type="dataset"
+        )
         print("Extracting...")
 
-        with tarfile.open(f'{download_path}/weapons_768.tar', 'r:*') as tar:
+        with tarfile.open(f'{data_path}', 'r:*') as tar:
             tar.extractall(path=download_path)
-        os.remove(f'{download_path}/weapons_768.tar')
+        os.remove(data_path)
         print("Done extracting data")
     if is_ddp:
         dist.barrier()
-
 
 # Create dataloader
 def get_dataloader(data_path, batch_size=64, num_workers=2, distributed=False, augment=False):
@@ -75,33 +76,6 @@ def get_dataloader(data_path, batch_size=64, num_workers=2, distributed=False, a
     )
     return loader, sampler
 
-
-def get_model():
-    model = YOLO('yolo11s.pt').model
-    print("YOLOv11 Loaded Successfully!")
-    num_classes = 3
-    detect_layer = model.model[23]
-    model.model[-1].nc = 3
-    model.nc = 3
-
-    for i in range(3):
-        old_conv = detect_layer.cv3[i][2]
-        in_ch = old_conv.in_channels
-
-        detect_layer.cv3[i][2] = nn.Conv2d(in_ch, num_classes, kernel_size=1)
-        nn.init.normal_(detect_layer.cv3[i][2].weight, std=0.01)
-        nn.init.constant_(detect_layer.cv3[i][2].bias, 0)
-
-    # Freeze all
-    for p in model.parameters():
-        p.requires_grad = False
-
-    for p in model.model[23].parameters():
-        p.requires_grad = True
-
-    return model
-
-
 def save_checkpoint(model, optimizer, epoch, path):
     is_ddp = dist.is_available() and dist.is_initialized()
     rank = dist.get_rank() if is_ddp else 0
@@ -124,7 +98,6 @@ def save_model(model, file_path):
     if is_ddp:
         dist.barrier()
 
-
 def load_checkpoint(model, optimizer, path):
     # load on CPU first to avoid GPU memory issues
     checkpoint = torch.load(path, map_location='cpu')
@@ -133,7 +106,6 @@ def load_checkpoint(model, optimizer, path):
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     epoch = checkpoint['epoch']
     return model, optimizer, epoch
-
 
 def validate_loss(model, criterion, val_loader, device):
     model.eval()
@@ -222,7 +194,6 @@ def validate_loss(model, criterion, val_loader, device):
         "mAP50_95": res["map"].item(),
     }
 
-
 def train_weapon_yolo(model, optimizer, scheduler, criterion, train_loader, train_sampler,
                       val_loader, n_epochs, device, checkpoint_dir, model_dir, is_dist):
     scaler = torch.cuda.amp.GradScaler()
@@ -297,7 +268,7 @@ def train_weapon_yolo(model, optimizer, scheduler, criterion, train_loader, trai
             #     "dfl":  f"{loss_items[2].item():.4f}",
             # })
 
-        save_checkpoint(model, optimizer, epoch,f"{checkpoint_dir}/epoch{epoch}.pt")
+        #save_checkpoint(model, optimizer, epoch,f"{checkpoint_dir}/epoch{epoch}.pt")
 
         n = len(train_loader)
 
@@ -322,14 +293,13 @@ def train_weapon_yolo(model, optimizer, scheduler, criterion, train_loader, trai
 
             if val_losses["mAP50"] > best_map:
                 best_map = val_losses["mAP50"]
-                save_model(model, f"{model_dir}/best_mAP50.pt")
+                save_model(model, f"{model_dir}/best_model.pt")
                 print("Saved BEST model with mAP50")
-
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--batch-size', type=int, default=64)
+    parser.add_argument('--epochs', type=int, default=1)
+    parser.add_argument('--batch-size', type=int, default=16)
     parser.add_argument('--checkpoint-dir', type=str, default='./checkpoints')
     parser.add_argument('--model-dir', type=str, default='./model')
     parser.add_argument('--data-dir', type=str, default='./data')
@@ -344,17 +314,8 @@ if __name__ == '__main__':
     os.makedirs(args.data_dir, exist_ok=True)
 
     download_data(args.data_dir)
-
     device = get_device(local_rank, is_dist)
-
-    model = get_model().to(device)
-    if is_dist:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
-
-    backbone_params = []
-    neck_params = []
-    head_params = []
-
+    model = get_model(device, is_dist, local_rank)
 
     criterion = v8DetectionLoss(model.module if is_dist else model)
     optimizer = torch.optim.AdamW([
@@ -372,6 +333,13 @@ if __name__ == '__main__':
     )
     val_loader, val_sampler = get_dataloader(
         f"{args.data_dir}/valid",
+        args.batch_size,
+        distributed=is_dist,
+        augment=False
+    )
+
+    test_loader, test_sampler = get_dataloader(
+        f"{args.data_dir}/test",
         args.batch_size,
         distributed=is_dist,
         augment=False
@@ -397,4 +365,8 @@ if __name__ == '__main__':
         args.model_dir,
         is_dist
     )
+
+    evaluate(f"{args.checkpoint_dir}/best_model.pt", test_loader, conf_threshold=0.4)
+
+
 
