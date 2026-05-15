@@ -226,7 +226,7 @@ def evaluate(model_path, test_loader, output_dir="output", conf_threshold=0.25, 
     # Load model
     print(f"Loading model from {model_path}")
     model = get_model(device, False, None)
-    model.load_state_dict(torch.load("./model/best_mAP50.pt", map_location=device))
+    model.load_state_dict(torch.load("./model/best_model.pt", map_location=device))
     model.to(device)
 
     # Run testing
